@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  tempo-bot:
+    build: .
+    container_name: tempo_bot_container
+    restart: always
+    env_file:
+      - .env
+    # Если бот должен видеть файлы на хосте (опционально, для логов)
+    # volumes:
+    #   - ./logs:/app/logs

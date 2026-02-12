@@ -1,0 +1,10 @@
+mattermostdriver
+pandas
+requests
+openpyxl
+xlsxwriter
+Jinja2
+atlassian-python-api
+beautifulsoup4
+lxml
+
