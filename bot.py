@@ -3,6 +3,7 @@ import sys
 import json
 import re
 import io
+import time
 import pandas as pd
 import requests
 import threading
@@ -159,11 +160,46 @@ def fetch_tempo_worklogs_for_users(start_date, end_date, worker_ids, progress_ca
         except: pass
     return all_worklogs
 
+# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ СОПОСТАВЛЕНИЯ ИМЕН (v3 - поддержка "уулу") ---
 def check_name_match(jira_name, excel_name):
     if not jira_name or not excel_name: return False
-    j_parts = [p for p in str(jira_name).lower().replace('.', ' ').split() if len(p)>1]
-    e_parts = [p for p in str(excel_name).lower().replace('.', ' ').split() if len(p)>1]
-    return not set(j_parts).isdisjoint(set(e_parts))
+    
+    # Меняем точки и дефисы на пробелы, чтобы корректно читать составные имена
+    j_clean = str(jira_name).lower().replace('.', ' ').replace('-', ' ').strip()
+    e_clean = str(excel_name).lower().replace('.', ' ').replace('-', ' ').strip()
+    
+    j_parts = [p for p in j_clean.split() if p]
+    e_parts = [p for p in e_clean.split() if p]
+    
+    if not j_parts or not e_parts: return False
+
+    # Разделяем на слова длиннее 1 символа (фамилии, приставки)
+    j_long = [p for p in j_parts if len(p) > 1]
+    e_long = [p for p in e_parts if len(p) > 1]
+
+    if not e_long: return False # В 1С нет фамилии, пропускаем
+
+    # 1. Главная фамилия из 1С (первое слово) ДОЛЖНА быть в учетке Jira
+    primary_surname = e_long[0]
+    if primary_surname not in j_long:
+        return False
+
+    # 2. Находим все общие длинные слова (фамилия + возможные уулу/кызы/оглы)
+    common_long = set(j_long).intersection(set(e_long))
+    
+    # 3. Достаем инициалы из 1С (одиночные буквы)
+    e_initials = [p for p in e_parts if len(p) == 1]
+    if not e_initials:
+        return True # Если нет инициала, а основная фамилия совпала — прощаем
+        
+    # 4. Проверяем оставшиеся слова в учетке Jira (это должно быть имя/отчество)
+    j_leftovers = [p for p in j_parts if p not in common_long]
+    if not j_leftovers:
+        return True # В Jira указана только фамилия без имени, считаем совпадением
+        
+    # Проверяем, начинается ли хотя бы одно из оставшихся слов в Jira на первый инициал из 1С
+    first_initial = e_initials[0]
+    return any(p.startswith(first_initial) for p in j_leftovers)
 
 def extract_period_from_excel(df_head):
     dates = []
@@ -193,10 +229,15 @@ def worker_process_file(file_id, channel_id, root_id):
         if raw_file_resp.status_code != 200: return
         file_bytes = io.BytesIO(raw_file_resp.content)
 
-        update_status_text("⏳ Читаю Excel...")
-        try: df_raw = pd.read_excel(file_bytes, header=None)
+        update_status_text("⏳ Читаю документ...")
+        try:
+            try:
+                df_raw = pd.read_excel(file_bytes, header=None)
+            except ValueError:
+                file_bytes.seek(0)
+                df_raw = pd.read_csv(file_bytes, header=None, sep=';', on_bad_lines='skip') 
         except Exception as e:
-            update_status_text(f"❌ Ошибка Excel: {e}")
+            update_status_text(f"❌ Ошибка чтения файла: {e}")
             return
 
         start_date, end_date = extract_period_from_excel(df_raw.head(20))
@@ -221,13 +262,21 @@ def worker_process_file(file_id, channel_id, root_id):
             update_status_text("❌ Не найдена колонка 'Фамилия'.")
             return
 
-        for c in range(len(df_raw.columns)-1, -1, -1):
-            if pd.notna(df_raw.iloc[len(df_raw)//2, c]):
-                try:
-                    float(str(df_raw.iloc[len(df_raw)//2, c]).replace(',','.'))
+        search_start = max(0, header_row_idx - 4)
+        search_end = min(len(df_raw), header_row_idx + 4)
+        
+        for r in range(search_start, search_end):
+            for c in range(name_col_idx + 1, len(df_raw.columns)):
+                cell_val = str(df_raw.iloc[r, c]).lower().replace('\n', ' ').strip()
+                if "месяц" in cell_val and "половину" not in cell_val and "числам" not in cell_val and "отметки" not in cell_val:
                     hours_col_idx = c
                     break
-                except: pass
+            if hours_col_idx is not None:
+                break
+
+        if hours_col_idx is None:
+            update_status_text("❌ Ошибка Excel: Не найдена колонка итоговых часов за месяц.")
+            return
 
         for r in range(header_row_idx, min(header_row_idx+3, len(df_raw))):
             for c in range(len(df_raw.columns)):
@@ -250,11 +299,10 @@ def worker_process_file(file_id, channel_id, root_id):
 
             for offset in range(4):
                 if i + offset >= len(df_raw): break
-                if hours_col_idx:
-                    try:
-                        h = float(str(df_raw.iloc[i+offset, hours_col_idx]).replace(',', '.').replace(' ', ''))
-                        if h > hours: hours = h
-                    except: pass
+                try:
+                    h = float(str(df_raw.iloc[i+offset, hours_col_idx]).replace(',', '.').replace(' ', ''))
+                    if h > hours: hours = h
+                except: pass
 
                 for ac in absence_cols:
                     val = df_raw.iloc[i+offset, ac]
@@ -339,35 +387,66 @@ def worker_process_file(file_id, channel_id, root_id):
 
         # 6. ОТПРАВКА В ЧАТ
         print("[THREAD] Отправка...", flush=True)
-        msg_lines = [f"📊 **Итог сверки**", f"ℹ️ {start_date} — {end_date} (Сотрудников: {len(target_jira_keys)})", "", ":al:  - Tempo > 1C", ":bangbang:  - см табель", "🔻  -  1C > Tempo", ""]
+        
+        # 6.1 Отправка легенды и файла
+        legend_lines = [
+            f"📊 **Итог сверки**", 
+            f"ℹ️ {start_date} — {end_date} (Сотрудников: {len(target_jira_keys)})", 
+            "", 
+            ":al:  - Tempo > 1C", 
+            ":bangbang:  - см табель", 
+            "🔻  -  1C > Tempo"
+        ]
+        
+        up_file = driver.files.upload_file(channel_id=channel_id, files={'files': ('report.xlsx', output)})
+        driver.posts.delete_post(status_post_id)
+        
+        driver.posts.create_post(options={
+            'channel_id': channel_id, 
+            'message': "\n".join(legend_lines), 
+            'root_id': root_id, 
+            'file_ids': [up_file['file_infos'][0]['id']]
+        })
+        time.sleep(0.3)
 
-        teams_with_issues = set() # Собираем команды с проблемами
-
+        teams_with_issues = set()
         unique_teams = []
         for t in df['Team']:
             if t not in unique_teams: unique_teams.append(t)
 
+        # 6.2 Отправка команд
         for team in unique_teams:
+            team_lines = []
             team_df = df[df['Team'] == team]
             bad = team_df[team_df['Статус'].str.contains("⚠️")]
+            
             if bad.empty:
-                msg_lines.append(f"📁 **{team}**: ✅ Все ОК")
+                team_lines.append(f"📁 **{team}**: ✅ Все ОК")
             else:
-                teams_with_issues.add(team) # Запоминаем проблемную команду
-                msg_lines.append(f"📁 **{team}**: ⚠️ Расхождений: **{len(bad)}**")
+                teams_with_issues.add(team)
+                team_lines.append(f"📁 **{team}**: ⚠️ Расхождений: **{len(bad)}**")
                 for _, r in bad.iterrows():
                     icon = "🔻" if r['Разница'] < 0 else ":al:"
                     bang = " :bangbang:" if any(c != 'В' and c for c in [x.strip().upper() for x in str(r['Неявки (1С)']).split(',')]) else ""
                     abs_s = f" ({r['Неявки (1С)']})" if r['Неявки (1С)'] else ""
-                    msg_lines.append(f"  - **{r['Сотрудник (1C)']}**: 1C=`{r['Часы 1С']}` | Tempo=`{r['Часы Tempo']}` | Diff: **{r['Разница']}** {icon}{bang}{abs_s}")
+                    team_lines.append(f"  - **{r['Сотрудник (1C)']}**: 1C=`{r['Часы 1С']}` | Tempo=`{r['Часы Tempo']}` | Diff: **{r['Разница']}** {icon}{bang}{abs_s}")
+            
+            driver.posts.create_post(options={
+                'channel_id': channel_id,
+                'message': "\n".join(team_lines),
+                'root_id': root_id
+            })
+            time.sleep(0.3)
 
+        # 6.3 Отправка ненайденных
         not_found = df[df['Статус'].str.contains("❓")]
         if not not_found.empty:
-            msg_lines.append(f"\n❓ **Не найдены ({len(not_found)}):**\n_{', '.join(not_found['Сотрудник (1C)'].head(5))}_...")
-
-        up_file = driver.files.upload_file(channel_id=channel_id, files={'files': ('report.xlsx', output)})
-        driver.posts.delete_post(status_post_id)
-        driver.posts.create_post(options={'channel_id': channel_id, 'message': "\n".join(msg_lines), 'root_id': root_id, 'file_ids': [up_file['file_infos'][0]['id']]})
+            driver.posts.create_post(options={
+                'channel_id': channel_id,
+                'message': f"❓ **Не найдены ({len(not_found)}):**\n_{', '.join(not_found['Сотрудник (1C)'].head(5))}_...",
+                'root_id': root_id
+            })
+            time.sleep(0.3)
 
         # 7. ТЕГИРОВАНИЕ ЛИДОВ
         if teams_with_issues and leads_mapping:
@@ -409,7 +488,7 @@ async def my_event_handler(event):
 
 # --- INIT ---
 if __name__ == "__main__":
-    print(f"🚀 Запуск (v5.1 Fixed) для {MM_URL}...", flush=True)
+    print(f"🚀 Запуск (v5.5 Name Match Pro) для {MM_URL}...", flush=True)
     driver = Driver({'url': MM_URL, 'token': MM_TOKEN, 'scheme': MM_SCHEME, 'port': MM_PORT, 'verify': VERIFY_SSL})
     try:
         JIRA_LOOKUP_CACHE, JIRA_KEY_CACHE = get_all_jira_users()
